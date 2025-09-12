@@ -1,0 +1,1 @@
+# Trabalho 1 de Programação Paralela
