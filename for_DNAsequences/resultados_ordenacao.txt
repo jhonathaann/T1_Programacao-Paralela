@@ -1,0 +1,3 @@
+Sequências: 1000, Tamanho: 50, Tempo: 0.000108 segundos
+sequencias: 100000, tamanho: 20, tempo: 0.021381 segundos
+sequencias: 100000, tamanho: 100, tempo: 0.036146 segundos
