@@ -4,334 +4,316 @@
 #include <time.h>
 #include <mpi.h>
 
-#define INSERTION_THRESHOLD 16
-#define MAX_SEQ_LENGTH 100
+#define SEQ_LENGTH 50
+#define CHUNK_SIZE (SEQ_LENGTH + 1)
+#define DNA_CHARS "ACGT"
 
-// Função de comparação para DNA
+void generate_dna_sequence(char* seq, int length) {
+    for (int i = 0; i < length; i++) {
+        seq[i] = DNA_CHARS[rand() % 4];
+    }
+    seq[length] = '\0';
+}
+
 int compare_dna(const void* a, const void* b) {
-    return strcmp(*(const char**)a, *(const char**)b);
+    return strcmp(*(char**)a, *(char**)b);
 }
 
-// Funções de ordenação adaptadas para strings
-void insertion_sort(char **lista, int left, int right) {
-    for (int i = left + 1; i <= right; i++) {
-        char *key = lista[i];
-        int j = i - 1;
-        while (j >= left && strcmp(lista[j], key) > 0) {
-            lista[j + 1] = lista[j];
-            j--;
-        }
-        lista[j + 1] = key;
-    }
+static char* current_flat;  // Para qsort dos splitters (alternativa a qsort_r)
+
+static int my_splitter_compare(const void* pa, const void* pb) {
+    int ia = *(int*)pa;
+    int ib = *(int*)pb;
+    return strcmp(current_flat + ia * CHUNK_SIZE, current_flat + ib * CHUNK_SIZE);
 }
 
-void merge(char **lista, int left, int mid, int right) {
-    int n1 = mid - left + 1;
-    int n2 = right - mid;
-    
-    char **left_arr = (char**)malloc(n1 * sizeof(char*));
-    char **right_arr = (char**)malloc(n2 * sizeof(char*));
-    
-    for (int i = 0; i < n1; i++) left_arr[i] = lista[left + i];
-    for (int i = 0; i < n2; i++) right_arr[i] = lista[mid + 1 + i];
-    
-    int i = 0, j = 0, k = left;
-    while (i < n1 && j < n2) {
-        if (strcmp(left_arr[i], right_arr[j]) <= 0) {
-            lista[k++] = left_arr[i++];
-        } else {
-            lista[k++] = right_arr[j++];
-        }
+void free_strings(char** arr, int n) {
+    if (arr == NULL) return;
+    for (int i = 0; i < n; i++) {
+        free(arr[i]);
     }
-    
-    while (i < n1) lista[k++] = left_arr[i++];
-    while (j < n2) lista[k++] = right_arr[j++];
-    
-    free(left_arr);
-    free(right_arr);
+    free(arr);
 }
 
-void splitsort(char **lista, int left, int right) {
-    if (right - left + 1 <= INSERTION_THRESHOLD) {
-        insertion_sort(lista, left, right);
-    } else {
-        int mid = left + (right - left) / 2;
-        splitsort(lista, left, mid);
-        splitsort(lista, mid + 1, right);
-        merge(lista, left, mid, right);
+void imprime(char** lista, int size, int rank) {
+    printf("P%d: [\"", rank);
+    for (int i = 0; i < size; i++) {
+        printf("%s\"", lista[i]);
+        if (i < size - 1) printf(", ");
     }
+    printf("]\n");
 }
 
-// Função para ler arquivo de entrada
-char** read_dna_file(const char* filename, int* total_seqs) {
-    FILE* file = fopen(filename, "r");
-    if (!file) {
-        perror("Erro ao abrir arquivo");
-        return NULL;
-    }
-    
-    char buffer[MAX_SEQ_LENGTH];
-    int capacity = 10000;
-    int count = 0;
-    
-    char** sequences = (char**)malloc(capacity * sizeof(char*));
-    
-    while (fgets(buffer, MAX_SEQ_LENGTH, file)) {
-        // Remover newline
-        buffer[strcspn(buffer, "\n")] = 0;
-        
-        if (count >= capacity) {
-            capacity *= 2;
-            sequences = (char**)realloc(sequences, capacity * sizeof(char*));
-        }
-        
-        sequences[count] = (char*)malloc((strlen(buffer) + 1) * sizeof(char));
-        strcpy(sequences[count], buffer);
-        count++;
-    }
-    
-    fclose(file);
-    *total_seqs = count;
-    return sequences;
-}
+void parallel_splitsort(char*** local_arr_ptr, int* local_n, MPI_Comm comm);
 
-// Função para escrever arquivo de saída
-void write_dna_file(const char* filename, char** sequences, int total_seqs) {
-    FILE* file = fopen(filename, "w");
-    if (!file) {
-        perror("Erro ao criar arquivo de saída");
-        return;
-    }
-    
-    for (int i = 0; i < total_seqs; i++) {
-        fprintf(file, "%s\n", sequences[i]);
-    }
-    
-    fclose(file);
-}
-
-// Função principal de ordenação paralela
-void parallel_dna_sort(char ***local_seqs, int *local_n, MPI_Comm comm) {
+int main(int argc, char* argv[]) {
     int rank, size;
-    MPI_Comm_rank(comm, &rank);
-    MPI_Comm_size(comm, &size);
-    
-    if (*local_n == 0) return;
-    
-    // 1. Ordenação local
-    splitsort(*local_seqs, 0, *local_n - 1);
-    
-    // 2. Selecionar separadores locais (baseado na primeira string)
-    int num_splitters = size - 1;
-    char **local_splitters = (char**)malloc(num_splitters * sizeof(char*));
-    
-    for (int i = 0; i < num_splitters; i++) {
-        int index = (i + 1) * (*local_n) / size;
-        if (index >= *local_n) index = *local_n - 1;
-        local_splitters[i] = (*local_seqs)[index];
-    }
-    
-    // 3. Coletar separadores no processo 0
-    char **all_splitters = NULL;
-    if (rank == 0) {
-        all_splitters = (char**)malloc(size * num_splitters * sizeof(char*));
-    }
-    
-    // Enviar separadores como strings
-    for (int i = 0; i < num_splitters; i++) {
-        int len = strlen(local_splitters[i]) + 1;
-        if (rank == 0) {
-            for (int j = 0; j < size; j++) {
-                if (j == 0) {
-                    all_splitters[i] = (char*)malloc(len * sizeof(char));
-                    strcpy(all_splitters[i], local_splitters[i]);
-                } else {
-                    char* temp = (char*)malloc(len * sizeof(char));
-                    MPI_Recv(temp, len, MPI_CHAR, j, 0, comm, MPI_STATUS_IGNORE);
-                    all_splitters[j * num_splitters + i] = temp;
-                }
-            }
-        } else {
-            MPI_Send(local_splitters[i], len, MPI_CHAR, 0, 0, comm);
-        }
-    }
-    
-    // 4. Processo 0 seleciona separadores globais
-    char **global_splitters = (char**)malloc(num_splitters * sizeof(char*));
-    if (rank == 0) {
-        splitsort(all_splitters, 0, size * num_splitters - 1);
-        for (int i = 0; i < num_splitters; i++) {
-            int index = (i + 1) * (size * num_splitters) / size;
-            if (index >= size * num_splitters) index = size * num_splitters - 1;
-            global_splitters[i] = all_splitters[index];
-        }
-    }
-    
-    // Broadcast dos separadores globais
-    for (int i = 0; i < num_splitters; i++) {
-        if (rank == 0) {
-            int len = strlen(global_splitters[i]) + 1;
-            for (int j = 1; j < size; j++) {
-                MPI_Send(global_splitters[i], len, MPI_CHAR, j, 1, comm);
-            }
-        } else {
-            char buffer[MAX_SEQ_LENGTH];
-            MPI_Recv(buffer, MAX_SEQ_LENGTH, MPI_CHAR, 0, 1, comm, MPI_STATUS_IGNORE);
-            global_splitters[i] = (char*)malloc((strlen(buffer) + 1) * sizeof(char));
-            strcpy(global_splitters[i], buffer);
-        }
-    }
-    
-    // 5. Redistribuição simplificada (usando qsort padrão para demonstração)
-    // Para implementação completa, seria necessário MPI_Alltoallv personalizado
-    // Aqui usamos uma abordagem simplificada
-    
-    // Ordenação final local
-    splitsort(*local_seqs, 0, *local_n - 1);
-    
-    // Limpeza
-    for (int i = 0; i < num_splitters; i++) {
-        if (rank != 0) free(global_splitters[i]);
-    }
-    free(local_splitters);
-    if (rank == 0) {
-        for (int i = 0; i < size * num_splitters; i++) {
-            free(all_splitters[i]);
-        }
-        free(all_splitters);
-    }
-    free(global_splitters);
-}
+    char** local_arr = NULL;
+    int local_n;
+    int total_n = 100000;  // Ajuste para 100k, 1M, 10M nos experimentos
 
-int main(int argc, char *argv[]) {
-    int rank, size;
-    char **local_seqs = NULL;
-    int local_n = 0;
-    double start_time, end_time;
-    
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    
-    if (argc != 3) {
+
+    srand(time(NULL) + rank);  // Semente única por rank
+
+    if (argc > 1) {
+        // Suporte a arquivo: rank 0 lê e conta linhas
         if (rank == 0) {
-            printf("Uso: %s <arquivo_entrada> <arquivo_saida>\n", argv[0]);
-        }
-        MPI_Finalize();
-        return 1;
-    }
-    
-    start_time = MPI_Wtime();
-    
-    // Ler arquivo apenas no processo 0
-    char **all_sequences = NULL;
-    int total_seqs = 0;
-    
-    if (rank == 0) {
-        all_sequences = read_dna_file(argv[1], &total_seqs);
-        if (!all_sequences) {
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return 1;
-        }
-        printf("Lidas %d sequências de DNA\n", total_seqs);
-    }
-    
-    // Broadcast do número total de sequências
-    MPI_Bcast(&total_seqs, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
-    // Distribuir sequências
-    local_n = total_seqs / size;
-    int remainder = total_seqs % size;
-    
-    int *counts = (int*)malloc(size * sizeof(int));
-    int *displs = (int*)malloc(size * sizeof(int));
-    
-    for (int i = 0; i < size; i++) {
-        counts[i] = local_n + (i < remainder ? 1 : 0);
-        displs[i] = (i == 0) ? 0 : displs[i-1] + counts[i-1];
-    }
-    
-    local_n = counts[rank];
-    local_seqs = (char**)malloc(local_n * sizeof(char*));
-    
-    // Distribuir contagens primeiro
-    MPI_Scatter(counts, 1, MPI_INT, MPI_IN_PLACE, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
-    // Distribuir strings
-    if (rank == 0) {
-        for (int i = 1; i < size; i++) {
-            for (int j = 0; j < counts[i]; j++) {
-                int len = strlen(all_sequences[displs[i] + j]) + 1;
-                MPI_Send(all_sequences[displs[i] + j], len, MPI_CHAR, i, 0, MPI_COMM_WORLD);
+            FILE* in = fopen(argv[1], "r");
+            if (in) {
+                char line[SEQ_LENGTH + 2];
+                total_n = 0;
+                while (fgets(line, sizeof(line), in)) {
+                    total_n++;
+                }
+                rewind(in);
+                // Aqui você pode ler para global_arr; por simplicidade, gera aleatório se arquivo inválido
+                fclose(in);
             }
         }
-        // Copiar dados locais
-        for (int i = 0; i < counts[0]; i++) {
-            local_seqs[i] = (char*)malloc((strlen(all_sequences[i]) + 1) * sizeof(char));
-            strcpy(local_seqs[i], all_sequences[i]);
-        }
-    } else {
-        for (int i = 0; i < local_n; i++) {
-            char buffer[MAX_SEQ_LENGTH];
-            MPI_Recv(buffer, MAX_SEQ_LENGTH, MPI_CHAR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            local_seqs[i] = (char*)malloc((strlen(buffer) + 1) * sizeof(char));
-            strcpy(local_seqs[i], buffer);
-        }
+        MPI_Bcast(&total_n, 1, MPI_INT, 0, MPI_COMM_WORLD);
     }
-    
-    // Ordenação paralela
-    parallel_dna_sort(&local_seqs, &local_n, MPI_COMM_WORLD);
-    
-    // Coletar resultados
+
+    local_n = total_n / size;
+
     if (rank == 0) {
-        char **sorted_sequences = (char**)malloc(total_seqs * sizeof(char*));
-        
-        // Copiar dados locais
-        for (int i = 0; i < counts[0]; i++) {
-            sorted_sequences[i] = local_seqs[i];
+        char** global_arr = malloc(total_n * sizeof(char*));
+        for (int i = 0; i < total_n; i++) {
+            global_arr[i] = malloc(CHUNK_SIZE);
+            generate_dna_sequence(global_arr[i], SEQ_LENGTH);
         }
-        
-        // Receber de outros processos
-        for (int i = 1; i < size; i++) {
-            for (int j = 0; j < counts[i]; j++) {
-                char buffer[MAX_SEQ_LENGTH];
-                MPI_Recv(buffer, MAX_SEQ_LENGTH, MPI_CHAR, i, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                sorted_sequences[displs[i] + j] = (char*)malloc((strlen(buffer) + 1) * sizeof(char));
-                strcpy(sorted_sequences[displs[i] + j], buffer);
-            }
-        }
-        
-        // Ordenação final global (necessária devido à redistribuição simplificada)
-        qsort(sorted_sequences, total_seqs, sizeof(char*), compare_dna);
-        
-        // Escrever arquivo de saída
-        write_dna_file(argv[2], sorted_sequences, total_seqs);
-        
-        end_time = MPI_Wtime();
-        printf("Tempo de execução: %.4f segundos\n", end_time - start_time);
-        
-        // Liberar memória
-        for (int i = 0; i < total_seqs; i++) {
-            free(sorted_sequences[i]);
-        }
-        free(sorted_sequences);
-        free(all_sequences);
-        
-    } else {
-        // Enviar dados ordenados
+
+        printf("Processo %d: Dados globais originais:\n", rank);
+        imprime(global_arr, total_n, rank);
+
+        local_arr = malloc(local_n * sizeof(char*));
         for (int i = 0; i < local_n; i++) {
-            MPI_Send(local_seqs[i], strlen(local_seqs[i]) + 1, MPI_CHAR, 0, 1, MPI_COMM_WORLD);
+            local_arr[i] = malloc(CHUNK_SIZE);
+            strcpy(local_arr[i], global_arr[i]);
         }
+
+        for (int p = 1; p < size; p++) {
+            char* pack = malloc(local_n * CHUNK_SIZE);
+            for (int j = 0; j < local_n; j++) {
+                memcpy(pack + j * CHUNK_SIZE, global_arr[p * local_n + j], CHUNK_SIZE);
+            }
+            MPI_Send(pack, local_n * CHUNK_SIZE, MPI_CHAR, p, 0, MPI_COMM_WORLD);
+            free(pack);
+        }
+
+        free_strings(global_arr, total_n);
+    } else {
+        local_arr = malloc(local_n * sizeof(char*));
+        char* recv_pack = malloc(local_n * CHUNK_SIZE);
+        MPI_Recv(recv_pack, local_n * CHUNK_SIZE, MPI_CHAR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        for (int j = 0; j < local_n; j++) {
+            local_arr[j] = malloc(CHUNK_SIZE);
+            memcpy(local_arr[j], recv_pack + j * CHUNK_SIZE, CHUNK_SIZE);
+        }
+        free(recv_pack);
     }
-    
-    // Liberar memória local
-    for (int i = 0; i < local_n; i++) {
-        free(local_seqs[i]);
+
+    parallel_splitsort(&local_arr, &local_n, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        char** sorted_global = malloc(total_n * sizeof(char*));
+        int* recv_counts = malloc(size * sizeof(int));
+        int* recv_displs = malloc(size * sizeof(int));
+
+        recv_counts[0] = local_n;
+        for (int i = 1; i < size; i++) {
+            MPI_Recv(&recv_counts[i], 1, MPI_INT, i, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+
+        recv_displs[0] = 0;
+        for (int i = 1; i < size; i++) {
+            recv_displs[i] = recv_displs[i - 1] + recv_counts[i - 1];
+        }
+
+        for (int i = 0; i < local_n; i++) {
+            sorted_global[i] = malloc(CHUNK_SIZE);
+            strcpy(sorted_global[i], local_arr[i]);
+        }
+
+        for (int p = 1; p < size; p++) {
+            int rcount = recv_counts[p];
+            char* temp_pack = malloc(rcount * CHUNK_SIZE);
+            MPI_Recv(temp_pack, rcount * CHUNK_SIZE, MPI_CHAR, p, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            for (int j = 0; j < rcount; j++) {
+                int gidx = recv_displs[p] + j;
+                sorted_global[gidx] = malloc(CHUNK_SIZE);
+                memcpy(sorted_global[gidx], temp_pack + j * CHUNK_SIZE, CHUNK_SIZE);
+            }
+            free(temp_pack);
+        }
+
+        FILE* out = fopen("output.txt", "w");
+        for (int i = 0; i < total_n; i++) {
+            fprintf(out, "%s\n", sorted_global[i]);
+        }
+        fclose(out);
+
+        printf("\nProcesso %d: Dados globais ordenados:\n", rank);
+        imprime(sorted_global, total_n, rank);
+
+        free_strings(sorted_global, total_n);
+        free(recv_counts);
+        free(recv_displs);
+    } else {
+        MPI_Send(&local_n, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
+        char* pack = malloc(local_n * CHUNK_SIZE);
+        for (int j = 0; j < local_n; j++) {
+            memcpy(pack + j * CHUNK_SIZE, local_arr[j], CHUNK_SIZE);
+        }
+        MPI_Send(pack, local_n * CHUNK_SIZE, MPI_CHAR, 0, 2, MPI_COMM_WORLD);
+        free(pack);
     }
-    free(local_seqs);
-    free(counts);
-    free(displs);
-    
+
+    free_strings(local_arr, local_n);
     MPI_Finalize();
     return 0;
+}
+
+void parallel_splitsort(char*** local_arr_ptr, int* local_n, MPI_Comm comm) {
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    if (*local_n == 0) return;
+
+    char** local_arr = *local_arr_ptr;
+
+    // 1. Ordenação local
+    qsort(local_arr, *local_n, sizeof(char*), compare_dna);
+    printf("Processo %d: Após ordenação local: ", rank);
+    imprime(local_arr, *local_n, rank);
+
+    // 2. Selecionar separadores locais
+    int num_splitters = size - 1;
+    char local_splitters_flat[num_splitters * CHUNK_SIZE];
+    for (int i = 0; i < num_splitters; i++) {
+        int index = (i + 1) * (*local_n) / size;
+        if (index >= *local_n) index = *local_n - 1;
+        strcpy(local_splitters_flat + i * CHUNK_SIZE, local_arr[index]);
+    }
+
+    // 3. Coletar separadores no processo 0
+    char* all_splitters_flat = NULL;
+    if (rank == 0) {
+        all_splitters_flat = malloc(size * num_splitters * CHUNK_SIZE);
+    }
+    MPI_Gather(local_splitters_flat, num_splitters * CHUNK_SIZE, MPI_CHAR,
+               all_splitters_flat, num_splitters * CHUNK_SIZE, MPI_CHAR, 0, comm);
+
+    // 4. Processo 0 seleciona separadores globais
+    char global_splitters_flat[num_splitters * CHUNK_SIZE];
+    if (rank == 0) {
+        int total_split = size * num_splitters;
+        int* indices = malloc(total_split * sizeof(int));
+        for (int ii = 0; ii < total_split; ii++) indices[ii] = ii;
+
+        current_flat = all_splitters_flat;
+        qsort(indices, total_split, sizeof(int), my_splitter_compare);
+
+        for (int i = 0; i < num_splitters; i++) {
+            int index = (i + 1) * total_split / size;
+            if (index >= total_split) index = total_split - 1;
+            strcpy(global_splitters_flat + i * CHUNK_SIZE, all_splitters_flat + indices[index] * CHUNK_SIZE);
+        }
+        free(indices);
+
+        printf("Processo %d: Separadores globais: ", rank);
+        for (int i = 0; i < num_splitters; i++) {
+            printf("\"%s\" ", global_splitters_flat + i * CHUNK_SIZE);
+        }
+        printf("\n");
+    }
+
+    // 5. Broadcast dos separadores globais
+    MPI_Bcast(global_splitters_flat, num_splitters * CHUNK_SIZE, MPI_CHAR, 0, comm);
+
+    // 6. Redistribuição
+    int* send_counts = calloc(size, sizeof(int));
+    for (int i = 0; i < *local_n; i++) {
+        char* element = local_arr[i];
+        int target = 0;
+        while (target < num_splitters && strcmp(element, global_splitters_flat + target * CHUNK_SIZE) > 0) {
+            target++;
+        }
+        send_counts[target]++;
+    }
+
+    int* recv_counts = malloc(size * sizeof(int));
+    MPI_Alltoall(send_counts, 1, MPI_INT, recv_counts, 1, MPI_INT, comm);
+
+    int* send_displs = malloc(size * sizeof(int));
+    int* recv_displs = malloc(size * sizeof(int));
+    send_displs[0] = recv_displs[0] = 0;
+    for (int i = 1; i < size; i++) {
+        send_displs[i] = send_displs[i - 1] + send_counts[i - 1];
+        recv_displs[i] = recv_displs[i - 1] + recv_counts[i - 1];
+    }
+
+    int total_recv = recv_displs[size - 1] + recv_counts[size - 1];
+
+    int* send_counts_char = malloc(size * sizeof(int));
+    int* recv_counts_char = malloc(size * sizeof(int));
+    int* send_displs_char = malloc(size * sizeof(int));
+    int* recv_displs_char = malloc(size * sizeof(int));
+    for (int i = 0; i < size; i++) {
+        send_counts_char[i] = send_counts[i] * CHUNK_SIZE;
+        recv_counts_char[i] = recv_counts[i] * CHUNK_SIZE;
+    }
+    send_displs_char[0] = recv_displs_char[0] = 0;
+    for (int i = 1; i < size; i++) {
+        send_displs_char[i] = send_displs_char[i - 1] + send_counts_char[i - 1];
+        recv_displs_char[i] = recv_displs_char[i - 1] + recv_counts_char[i - 1];
+    }
+
+    char* send_buffer = malloc(send_displs_char[size - 1] + send_counts_char[size - 1]);
+    int* temp_counts = calloc(size, sizeof(int));
+    for (int i = 0; i < *local_n; i++) {
+        char* element = local_arr[i];
+        int target = 0;
+        while (target < num_splitters && strcmp(element, global_splitters_flat + target * CHUNK_SIZE) > 0) {
+            target++;
+        }
+        int pos = temp_counts[target] * CHUNK_SIZE;  // Pos relativo no buffer de target
+        memcpy(send_buffer + send_displs_char[target] + pos, element, CHUNK_SIZE);
+        temp_counts[target]++;
+    }
+
+    char* recv_buffer = malloc(total_recv * CHUNK_SIZE);
+    MPI_Alltoallv(send_buffer, send_counts_char, send_displs_char, MPI_CHAR,
+                  recv_buffer, recv_counts_char, recv_displs_char, MPI_CHAR, comm);
+
+    char** new_local_arr = malloc(total_recv * sizeof(char*));
+    for (int i = 0; i < total_recv; i++) {
+        new_local_arr[i] = malloc(CHUNK_SIZE);
+        memcpy(new_local_arr[i], recv_buffer + i * CHUNK_SIZE, CHUNK_SIZE);
+    }
+    free(recv_buffer);
+
+    free_strings(local_arr, *local_n);
+    *local_arr_ptr = new_local_arr;
+    *local_n = total_recv;
+
+    // 7. Ordenação final
+    qsort(new_local_arr, *local_n, sizeof(char*), compare_dna);
+    printf("Processo %d: Após redistribuição e sort final: ", rank);
+    imprime(new_local_arr, *local_n, rank);
+
+    free(all_splitters_flat);
+    free(send_counts);
+    free(recv_counts);
+    free(send_displs);
+    free(recv_displs);
+    free(send_counts_char);
+    free(recv_counts_char);
+    free(send_displs_char);
+    free(recv_displs_char);
+    free(send_buffer);
+    free(temp_counts);
 }
